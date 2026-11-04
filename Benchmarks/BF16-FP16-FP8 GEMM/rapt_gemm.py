@@ -5,7 +5,8 @@ and linear() then returns False instead of running).
 
     w_packed = rapt_gemm.pack_weight(w)        # once per weight, w [N, K]
     y = rapt_gemm.linear(x, w_packed)          # y[M,N] = x[M,K] @ w^T
-                                               # bf16 -> bf16, fp16 -> fp16, fp8 e4m3 -> bf16 (no scales)
+                                               # bf16 -> bf16, fp16 -> fp16, fp8 e4m3 -> bf16
+    y = rapt_gemm.linear(x8, w8_packed, scale_a=sa, scale_b=sb)   # fp8 with per-tensor scales, = torch._scaled_mm
 Shape rules: N % 256 == 0, K % 256 == 0 (fp8: K % 512 == 0), any M; x contiguous [M, K] on the GPU.
 """
 import ctypes
@@ -20,6 +21,8 @@ _LIB = ctypes.CDLL(str(Path(__file__).resolve().parent / "librapt_gemm.so"))
 for _f in (_LIB.rapt_gemm_bf16, _LIB.rapt_gemm_f16, _LIB.rapt_gemm_fp8):
     _f.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
     _f.restype = ctypes.c_int
+_LIB.rapt_gemm_fp8_scaled.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 4 + [ctypes.c_void_p] * 3
+_LIB.rapt_gemm_fp8_scaled.restype = ctypes.c_int
 _LIB.rapt_gemm_device_supported.argtypes = [ctypes.c_int]
 _LIB.rapt_gemm_device_supported.restype = ctypes.c_int
 FP8 = torch.float8_e4m3fn                      # OCP E4M3, the gfx12 WMMA fp8 format
@@ -60,9 +63,19 @@ def pack_weight(w: torch.Tensor) -> torch.Tensor:
     return p.view(w.dtype) if w.dtype == FP8 else p
 
 
-def linear(x: torch.Tensor, w_packed: torch.Tensor, out: torch.Tensor = None):
+def _scale_ptr(s, x, name):
+    if s is None:
+        return None
+    if not (isinstance(s, torch.Tensor) and s.dtype == torch.float32 and s.numel() == 1 and s.device == x.device):
+        raise ValueError(f"{name} must be a single-element float32 tensor on {x.device} (per-tensor scale)")
+    return s.data_ptr()
+
+
+def linear(x: torch.Tensor, w_packed: torch.Tensor, out: torch.Tensor = None, scale_a: torch.Tensor = None,
+           scale_b: torch.Tensor = None):
     """x [M, K] @ w^T with w packed by pack_weight; returns [M, N] in out_dtype(x.dtype), or False when the GPU is
-    not an R9700 / R9600D."""
+    not an R9700 / R9600D. fp8 only: scale_a / scale_b = per-tensor float32 scales on the GPU, applied as
+    (x @ w^T) * scale_a * scale_b exactly like torch._scaled_mm."""
     if not device_supported(x.device):
         if x.device not in _warned:
             _warned.add(x.device)
@@ -75,11 +88,18 @@ def linear(x: torch.Tensor, w_packed: torch.Tensor, out: torch.Tensor = None):
         raise ValueError(f"unsupported GEMM M={M} N={N} K={K} {x.dtype} (weights {w_packed.dtype})")
     if not (x.is_contiguous() and w_packed.is_contiguous()):
         raise ValueError("x and w_packed must be contiguous GPU tensors")
+    if (scale_a is not None or scale_b is not None) and x.dtype != FP8:
+        raise ValueError("scale_a / scale_b are supported for fp8 inputs only")
+    sa, sb = _scale_ptr(scale_a, x, "scale_a"), _scale_ptr(scale_b, x, "scale_b")
     if out is None:
         out = torch.empty((M, N), dtype=out_dtype(x.dtype), device=x.device)
     with torch.cuda.device(x.device):
-        err = _FN[x.dtype](x.data_ptr(), w_packed.data_ptr(), out.data_ptr(), M, N, K, GSM,
-                           torch.cuda.current_stream(x.device).cuda_stream)
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        if sa is not None or sb is not None:
+            err = _LIB.rapt_gemm_fp8_scaled(x.data_ptr(), w_packed.data_ptr(), out.data_ptr(), M, N, K, GSM, stream,
+                                            sa, sb)
+        else:
+            err = _FN[x.dtype](x.data_ptr(), w_packed.data_ptr(), out.data_ptr(), M, N, K, GSM, stream)
     if err:
         raise RuntimeError(f"rapt_gemm launch failed (hipError {err})")
     return out
